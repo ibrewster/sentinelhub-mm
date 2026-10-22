@@ -1,4 +1,6 @@
 requests
-requests-oathlib
+requests-oauthlib
 oauthlib
 Pillow
+pandas
+shapely
