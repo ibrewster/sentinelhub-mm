@@ -1,0 +1,4 @@
+requests
+requests-oathlib
+oauthlib
+Pillow
