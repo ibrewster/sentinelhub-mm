@@ -5,9 +5,12 @@ from datetime import datetime,UTC
 from pathlib import Path
 from typing import overload, Literal, Any
 
+import numpy
+import pandas
 import requests
 
 import oauthlib.oauth2.rfc6749.errors
+import shapely
 from oauthlib.oauth2 import BackendApplicationClient, TokenExpiredError
 from requests_oauthlib import OAuth2Session
 
@@ -74,7 +77,56 @@ def auth(token_only: bool = False) -> dict | OAuth2Session:
 
     return session
 
-def search_sentinelhub(session: OAuth2Session, payload: dict) -> list[Any]:
+
+def acquisition_pass_key(sensor: str, scene_id: str, acquired: str) -> str:
+    """
+    Return a key identifying the single acquisition pass a scene belongs to, so
+    that multiple tiles from the same overpass collapse to one result.
+
+    Prefers structure parsed from the scene id (Sentinel-2 datatake+orbit, or
+    Landsat path/row+date). Falls back to the acquisition datetime rounded to
+    the minute when the id format is unrecognized.
+    """
+    safe_id = scene_id or ""
+
+    if m := constants.S2_ID_RE.search(safe_id):
+        return f"S2:{m.group(1)}:R{m.group(2)}"
+
+    if m := constants.LANDSAT_ID_RE.match(safe_id):
+        return f"L:{m.group(1)}:{m.group(2)}"
+
+    # Fallback: round acquisition time to the minute (drop seconds/fraction).
+    return f"{sensor}:{(acquired or '')[:16]}"
+
+def features_to_frame(features: list[dict], sensor: str) -> pandas.DataFrame:
+    """One row per STAC feature. Volcano association happens later."""
+    rows = []
+    for f in features:
+        props = f.get("properties", {})
+        scene_id = str(f.get("id", ""))
+        acquired = props.get("datetime") or props.get("start_datetime") or ""
+        cloud = props.get(constants.CLOUD_COVER_FIELD)
+        rows.append((
+            scene_id,
+            sensor,
+            acquired,
+            cloud,
+            acquisition_pass_key(sensor, scene_id, acquired),
+            shapely.geometry.shape(f["geometry"]),
+        ))
+
+    scenes = pandas.DataFrame(
+        rows,
+        columns=["scene_id", "sensor", "acquired", "cloud",
+                 "key", "geometry"],
+    )
+
+    ## Convert cloud cover to numeric, coercing errors to NaN. Single vectorized operation for efficiency.
+    scenes["cloud"] = pandas.to_numeric(scenes["cloud"], errors="coerce")
+
+    return scenes
+
+def search_sentinelhub(session: OAuth2Session, payload: dict) -> pandas.DataFrame:
     """Search the SentinelHub STAC catalog.
 
     Args:
@@ -82,31 +134,40 @@ def search_sentinelhub(session: OAuth2Session, payload: dict) -> list[Any]:
         payload: A dictionary of search parameters to send to the STAC API.
 
     Returns:
-        A list of features from the STAC API response.
+        A pandas DataFrame containing the search results.
     """
-    features=[]
-    while True:
-        try:
-            response = session.post(constants.SEARCH_URL, json=payload, timeout=60)
-            response.raise_for_status()
-        except TokenExpiredError as e:
-            logging.warning(f"Token expired: {e}. Refreshing token and retrying.")
-            session = auth()  # Refresh the session with a new token
-            continue
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Request failed: {e}")
-            return []
+    frames=[]
+    for sensor, sensor_info in constants.SENSORS.items():
+        payload["collections"] = [sensor_info["collection"]]
+        logging.info(f"Searching for {sensor} data...")
 
-        data = response.json()
-        features.extend(data.get('features', []))
+        features=[]
+        response=None
+        while True:
+            try:
+                response = session.post(constants.SEARCH_URL, json=payload, timeout=60)
 
-        next_val = data['context'].get('next', -1)
-        next_val = int(next_val)
-        if next_val<0:
-            break
+                if not response.ok:
+                    logging.error(f"Request failed with status code {response.status_code}. Response: {response.text}")
+                    response.raise_for_status()
+            except TokenExpiredError as e:
+                logging.warning(f"Token expired: {e}. Refreshing token and retrying.")
+                session = auth()  # Refresh the session with a new token
+                continue
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Request failed: {e}. Response: {response.text if response else 'No response'}")
+                return pandas.DataFrame()
 
-        payload['next'] = next_val
-        logging.info(f"Fetching next page: {next_val}")
+            data = response.json()
+            features.extend(data.get('features', []))
+            frames.append(features_to_frame(features, sensor))
 
+            next_val = data['context'].get('next', -1)
+            next_val = int(next_val)
+            if next_val<0:
+                break
 
-    return features
+            payload['next'] = next_val
+            logging.info(f"Fetching next page: {next_val}")
+
+    return pandas.concat(frames, ignore_index=True)

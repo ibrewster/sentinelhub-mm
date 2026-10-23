@@ -1,5 +1,7 @@
 import sys
+
 from pathlib import Path
+from urllib.parse import urlencode
 
 import numpy
 import numpy as np
@@ -159,18 +161,48 @@ def load_targets() -> pandas.DataFrame:
     is_alaska:numpy.ndarray = df["latitude"] > MARIANA_LAT_MAX
     df = (
         df.assign(
-            _color=df["color"].map(COLOR_RANK),
-            _region=(~is_alaska).astype(int),  # Alaska 0, Mariana 1
-            _pos=np.where(is_alaska, df["longitude"] % 360, -df["latitude"]),
+            color_rank=df["color"].map(COLOR_RANK),
+            region=(~is_alaska).astype(int),  # Alaska 0, Mariana 1
+            pos=np.where(is_alaska, df["longitude"] % 360, -df["latitude"]),
         )
-        .sort_values(["_color", "_region", "_pos"], kind="stable")
-        .drop(columns=["_color", "_region", "_pos"])
     )
 
     boxes = build_bbox(df["latitude"].values, df["longitude"].values)
     df["bbox"] = boxes
-    points=shapely.points(df["longitude"].values, df["latitude"].values)
-    df['point'] = points
-    tree = shapely.STRtree(boxes)
 
     return df
+
+def build_browser_link(
+    lat: float,
+    lon: float,
+    sensor: str,
+    acquired: str,
+    zoom: int = 12,
+) -> str:
+    """
+    Build a Copernicus Browser URL centred on the target that selects the given
+    dataset and the acquisition day of the scene.
+
+    The Copernicus Browser reads its state from the URL query string. We provide
+    the map centre (lat/lng), a zoom level, the dataset id, the visualization
+    layer (`layerId`), and the from/to time window pinned to the scene's
+    acquisition day so the scene is shown.
+
+    `acquired` is the scene datetime as an ISO 8601 string (e.g.
+    '2026-10-19T21:34:11Z'); only the date portion is used for the day window.
+    """
+    dataset = constants.SENSORS[sensor]["browser_dataset"]
+    layer = constants.SENSORS[sensor]["browser_layer"]
+    day = acquired[:10]  # YYYY-MM-DD
+    from_time = f"{day}T00:00:00.000Z"
+    to_time = f"{day}T23:59:59.999Z"
+    params = {
+        "zoom": zoom,
+        "lat": f"{lat:.6f}",
+        "lng": f"{lon:.6f}",
+        "fromTime": from_time,
+        "toTime": to_time,
+        "datasetId": dataset,
+        "layerId": layer,
+    }
+    return f"{constants.BROWSER_BASE_URL}?{urlencode(params)}"
