@@ -4,3 +4,7 @@ oauthlib
 Pillow
 pandas
 shapely
+mattermostdriver
+matplotlib
+pycoast
+pyresample

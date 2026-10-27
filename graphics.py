@@ -19,17 +19,28 @@ as opposed to the Catalog API used for scene discovery.
 from __future__ import annotations
 
 import io
+import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
+from matplotlib import patheffects as pe
+from matplotlib.ticker import FuncFormatter, MaxNLocator
+from PIL import Image
+from pycoast import ContourWriterAGG
+from pyresample.geometry import AreaDefinition
 
 from constants import PROCESS_URL, SENSORS
 from utils import bbox_edges
+import config
 
 # Pixel size of the fetched imagery (square). 1000 px over 10 km = 10 m/px,
 # matching Sentinel-2's native resolution; Landsat (30 m) is upsampled.
-IMAGE_PX = 1000
+# Using a smaller image size (e.g. 512 px) reduces the download size.
+IMAGE_PX = 500
 
 
 # -----------------------------------------------------------------------------
@@ -169,210 +180,76 @@ def fetch_scene_png(
 # -----------------------------------------------------------------------------
 # Annotation
 # -----------------------------------------------------------------------------
-def _load_font(size: int):
-    from PIL import ImageFont
-
-    # Try a few common TrueType fonts; fall back to PIL's bitmap default.
-    for name in (
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/Library/Fonts/Arial.ttf",
-        "DejaVuSans.ttf",
-    ):
-        try:
-            return ImageFont.truetype(name, size)
-        except Exception:  # noqa: BLE001
-            continue
-    return ImageFont.load_default()
+DPI = 100
+M_X, M_TOP, M_BOTTOM = 70, 90, 70  # figure margins, px
 
 
-def _decimals_for_step(step: float) -> int:
-    """Number of decimal places needed to represent `step` exactly (min 1)."""
-    s = f"{step:.6f}".rstrip("0").rstrip(".")
-    if "." in s:
-        return len(s.split(".")[1])
-    return 0
+def _deg_formatter(pos: str, neg: str) -> FuncFormatter:
+    def fmt(v: float, _pos) -> str:
+        num = f"{abs(v):.4f}".rstrip("0").rstrip(".")
+        return f"{num}\u00b0{pos if v >= 0 else neg}"
 
+    return FuncFormatter(fmt)
 
-def _fmt_deg(value: float, decimals: int, pos: str, neg: str) -> str:
-    """Format a degree value with `decimals` places (trailing zeros trimmed)."""
-    hemi = pos if value >= 0 else neg
-    num = f"{abs(value):.{decimals}f}"
-    if "." in num:
-        num = num.rstrip("0").rstrip(".")
-    return f"{num}\u00b0{hemi}"
-
-
-def _fmt_lat(lat: float, decimals: int = 3) -> str:
-    return _fmt_deg(lat, decimals, "N", "S")
-
-
-def _fmt_lon(lon: float, decimals: int = 3) -> str:
-    return _fmt_deg(lon, decimals, "E", "W")
-
-
-# Candidate "round" tick spacings in degrees, largest first.
-_NICE_STEPS = [1.0, 0.5, 0.25, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001]
-
-
-def nice_ticks(lo: float, hi: float, min_ticks: int = 2) -> list[float]:
-    """
-    Return round-number tick values within [lo, hi], choosing the largest nice
-    step (1, 0.5, 0.25, 0.2, 0.1, 0.05, ...) that still yields at least
-    `min_ticks` ticks inside the range. Ticks are multiples of the step.
-    """
-    lo, hi = (lo, hi) if lo <= hi else (hi, lo)
-    span = hi - lo
-    if span <= 0:
-        return [lo]
-    chosen = _NICE_STEPS[-1]
-    for step in _NICE_STEPS:
-        # Count multiples of `step` strictly within [lo, hi].
-        first = math.ceil(lo / step) * step
-        n = 0
-        x = first
-        while x <= hi + 1e-9:
-            n += 1
-            x += step
-        if n >= min_ticks:
-            chosen = step
-            break
-    ticks = []
-    first = math.ceil(lo / chosen - 1e-9) * chosen
-    x = first
-    while x <= hi + 1e-9:
-        ticks.append(round(x, 6))
-        x += chosen
-    return ticks
-
+def add_coastlines(scene, bbox, gshhg_dir, level=2):
+    area = AreaDefinition("scene", "", "", "EPSG:4326", scene.width, scene.height,
+                          (bbox.west, bbox.south, bbox.east, bbox.north))
+    ContourWriterAGG(gshhg_dir).add_coastlines(
+        scene, area, resolution="f", level=level, width=1, outline=(255, 255, 0))
 
 def annotate_image(
-    png_bytes: bytes,
-    target: str,
-    sensor: str,
-    acquired: str,
-    bbox: BBox,
-    bbox_km: float,
-):
-    """
-    Return a Pillow Image rendering the scene on a white background with:
-      - a black-text header (target | sensor | datetime)
-      - a black frame around the imagery
-      - latitude/longitude tick marks and labels on all four sides, placed at
-        round-number values (>=2 per side) via `nice_ticks`
-      - a scale bar (km)
-    """
-    from PIL import Image, ImageDraw
-
+        png_bytes: bytes, target: str, sensor: str, acquired: str, bbox, bbox_km: float
+) -> Image.Image:
     scene = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    #add_coastlines(scene, bbox, config.GSHHG_DIR, level=1)
+
     w, h = scene.size
+    W, H = w + 2 * M_X, h + M_TOP + M_BOTTOM
 
-    header_h = max(70, h // 11)
-    # Margins hold tick labels. Latitude labels are rotated vertical, so left/
-    # right need only ~label-height of space (not full label width).
-    tick_px = max(13, header_h // 5)
-    m_left = max(40, tick_px + h // 90 + 12)
-    m_right = max(40, tick_px + h // 90 + 12)
-    m_bottom = max(70, h // 14)
-    m_top_pad = max(10, h // 100)
+    # Build the Figure directly (no pyplot): no global state, safe in threads/GUI.
+    fig = Figure(figsize=(W / DPI, H / DPI), dpi=DPI, facecolor="white")
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([M_X / W, M_BOTTOM / H, w / W, h / H])
 
-    canvas_w = w + m_left + m_right
-    canvas_h = h + header_h + m_bottom
-    canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))  # white bg
+    ax.imshow(scene, extent=(bbox.west, bbox.east, bbox.south, bbox.north),
+              interpolation="none")
+    # Image is square on the ground, so 1 deg lon must be drawn cos(lat) as wide
+    # as 1 deg lat. (imshow's default aspect='equal' would stretch it E-W.)
+    ax.set_aspect(1 / math.cos(math.radians((bbox.south + bbox.north) / 2)))
 
-    img_x, img_y = m_left, header_h
-    canvas.paste(scene, (img_x, img_y))
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 5, 10]))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 5, 10]))
+    ax.xaxis.set_major_formatter(_deg_formatter("E", "W"))
+    ax.yaxis.set_major_formatter(_deg_formatter("N", "S"))
+    ax.tick_params(top=True, right=True, labeltop=True, labelright=True,
+                   length=6, width=1.5, labelsize=15)
+    ax.tick_params(axis="y", labelrotation=90)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.5)
 
-    draw = ImageDraw.Draw(canvas)
-    black = (0, 0, 0)
-    title_font = _load_font(max(20, header_h // 3))
-    tick_font = _load_font(max(13, header_h // 5))
-
-    # --- header (black text) ---
-    header = f"{target}   |   {sensor}   |   {acquired}"
-    draw.text((img_x, m_top_pad), header, fill=black, font=title_font)
-
-    # --- black frame around the imagery ---
-    frame_w = max(2, h // 400)
-    draw.rectangle(
-        [img_x - 1, img_y - 1, img_x + w, img_y + h], outline=black, width=frame_w
+    ax.text(
+        0.05, 0.95, f"{target} | {sensor}\n{acquired}",
+        transform=ax.transAxes,
+        ha="left", va="top",
+        color="white", fontsize=16,
+    #    bbox=dict(facecolor="black", alpha=0.6, edgecolor="none", boxstyle="round,pad=0.3")
+        path_effects=[
+            pe.SimpleLineShadow(offset=(2, -2), shadow_color="black", alpha=0.8),
+            pe.Normal()
+        ]
     )
 
-    # --- lat/lon ticks on all four sides ---
-    tick_len = max(8, h // 90)
-
-    def lon_to_x(lon: float) -> float:
-        return img_x + (lon - bbox.west) / (bbox.east - bbox.west) * w
-
-    def lat_to_y(lat: float) -> float:
-        # North at top: higher latitude -> smaller y.
-        return img_y + (bbox.north - lat) / (bbox.north - bbox.south) * h
-
-    def text_wh(s, font):
-        box = draw.textbbox((0, 0), s, font=font)
-        return box[2] - box[0], box[3] - box[1]
-
-    lon_ticks = nice_ticks(bbox.west, bbox.east, min_ticks=2)
-    lat_ticks = nice_ticks(bbox.south, bbox.north, min_ticks=2)
-    lon_dec = _decimals_for_step(lon_ticks[1] - lon_ticks[0]) if len(lon_ticks) > 1 else 3
-    lat_dec = _decimals_for_step(lat_ticks[1] - lat_ticks[0]) if len(lat_ticks) > 1 else 3
-
-    # Longitude ticks: top and bottom edges.
-    for lon in lon_ticks:
-        x = lon_to_x(lon)
-        label = _fmt_lon(lon, lon_dec)
-        tw, th = text_wh(label, tick_font)
-        # top edge
-        draw.line([(x, img_y), (x, img_y - tick_len)], fill=black, width=2)
-        draw.text((x - tw / 2, img_y - tick_len - th - 3), label, fill=black, font=tick_font)
-        # bottom edge
-        draw.line([(x, img_y + h), (x, img_y + h + tick_len)], fill=black, width=2)
-        draw.text((x - tw / 2, img_y + h + tick_len + 3), label, fill=black, font=tick_font)
-
-    # Latitude ticks: left and right edges, with labels rotated vertical so they
-    # do not extend far into the margins.
-    def _vlabel(text: str):
-        """Render `text` to a tight RGBA image rotated 90deg (reads bottom->top)."""
-        tw, th = text_wh(text, tick_font)
-        chip = Image.new("RGBA", (tw + 2, th + 2), (255, 255, 255, 0))
-        ImageDraw.Draw(chip).text((1, 1), text, fill=black, font=tick_font)
-        return chip.rotate(90, expand=True)
-
-    for lat in lat_ticks:
-        y = lat_to_y(lat)
-        label = _fmt_lat(lat, lat_dec)
-        vlab = _vlabel(label)
-        lw, lh = vlab.size
-        # Clamp vertical position so labels near the top/bottom edges are not
-        # clipped by the canvas; keep them as close to their tick as possible.
-        paste_y = int(y - lh / 2)
-        paste_y = max(0, min(paste_y, canvas_h - lh))
-        # left edge
-        draw.line([(img_x, y), (img_x - tick_len, y)], fill=black, width=2)
-        canvas.paste(vlab, (int(img_x - tick_len - lw - 3), paste_y), vlab)
-        # right edge
-        draw.line([(img_x + w, y), (img_x + w + tick_len, y)], fill=black, width=2)
-        canvas.paste(vlab, (int(img_x + w + tick_len + 3), paste_y), vlab)
-
-    # --- scale bar (inside image, lower-left, white bar w/ black outline) ---
-    px_per_km = w / bbox_km
+    # Scale bar, lower-left, in axes coordinates (image spans bbox_km edge to edge).
     bar_km = 2.0 if bbox_km >= 6 else 1.0
-    bar_px = int(px_per_km * bar_km)
-    bar_x0 = img_x + int(0.06 * w)
-    bar_y = img_y + h - int(0.07 * h)
-    bar_h = max(5, h // 150)
-    draw.rectangle(
-        [bar_x0, bar_y, bar_x0 + bar_px, bar_y + bar_h],
-        fill=(255, 255, 255),
-        outline=black,
-        width=2,
-    )
-    # Label centered horizontally on the bar, above it, no background chip.
-    _tw, _th = text_wh(f"{bar_km:g} km", tick_font)
-    lx = bar_x0 + (bar_px - _tw) / 2
-    ly = bar_y - _th - 4
-    draw.text((lx, ly), f"{bar_km:g} km", fill=black, font=tick_font)
-    return canvas
+    x0, y0 = 0.06, 0.07
+    ax.add_patch(Rectangle((x0, y0), bar_km / bbox_km, 0.012,
+                           transform=ax.transAxes, fc="white", ec="black", lw=1.5))
+    ax.text(x0 + bar_km / bbox_km / 2, y0 + 0.02, f"{bar_km:g} km",
+            transform=ax.transAxes, ha="center", va="bottom", fontsize=15, color="white")
+
+    fig.canvas.draw()
+    return Image.frombuffer("RGBA", fig.canvas.get_width_height(),
+                            fig.canvas.buffer_rgba()).convert("RGB")
 
 
 # -----------------------------------------------------------------------------
@@ -392,10 +269,25 @@ def generate_scene_image(
     Fetch, annotate, and save one scene image. Returns the saved file path.
     Raises on fetch/render errors (caller decides whether to continue).
     """
-    bbox = BBox.centered(lat, lon, size_km=bbox_km)
-    png = fetch_scene_png(session, sensor, bbox, acquired)
-    img = annotate_image(png, target, sensor, acquired, bbox, bbox_km)
+    img = render_scene_image(
+        session, target, lat, lon, sensor, acquired, bbox_km
+    )
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, safe_filename(target, acquired, sensor))
     img.save(path, format="PNG")
     return path
+
+
+def render_scene_image(
+    session,
+    target: str,
+    lat: float,
+    lon: float,
+    sensor: str,
+    acquired: str,
+    bbox_km: float = 10.0,
+):
+    """Fetch and annotate one scene without writing it to disk."""
+    bbox = BBox.centered(lat, lon, size_km=bbox_km)
+    png = fetch_scene_png(session, sensor, bbox, acquired)
+    return annotate_image(png, target, sensor, acquired, bbox, bbox_km)

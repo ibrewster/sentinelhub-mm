@@ -1,3 +1,4 @@
+import io
 import logging
 import os
 
@@ -8,6 +9,8 @@ import shapely
 
 import config
 import constants
+import graphics
+import mattermost
 import utils
 import sentinelhub
 
@@ -140,9 +143,39 @@ if __name__ == "__main__":
     volc_features = volc_features.sort_values(["color_rank", "region", "pos"], kind="stable")
     volc_features = volc_features.reset_index(drop=True)
 
-    # TODO: Create an image for each scene using the functions in graphics.py, and hold them in memory for the mattermost post.
-    # Thought: do we need to loop through the volc_features DataFrame, and create and post the image one at a time, or can we create all the images first and then post them all at once?  I think the latter is better, but it may require more memory.  We'll see how many scenes we get back from the search.
-    ## TODO: Make a mattermost post with the results, including volcano name, sensor, acquisition time, cloud cover, coverage percentage, and view link.
+    ## Render each scene sequentially and post it to Mattermost immediately.
+    mm_client, mm_channel = mattermost.connect()
+    for row in volc_features.itertuples(index=False):
+        image = graphics.render_scene_image(
+            session=session,
+            target=row.volcano,
+            lat=row.latitude,
+            lon=row.longitude,
+            sensor=row.sensor,
+            acquired=row.acquired,
+        )
+        image_buffer = io.BytesIO()
+        image.save(image_buffer, format="PNG")
+
+        filename = (
+            f"{row.volcano}_{row.sensor}_{row.acquired}.png"
+        )
+        message = (
+            f"### {row.volcano} ({row.color})\n"
+            f"**Sensor:** {row.sensor}\n"
+            f"**Acquired:** {row.acquired} UTC\n"
+   #         f"**Cloud cover:** {row.cloud:.1f}%\n"
+   #         f"**Coverage:** {row.coverage * 100:.1f}%\n"
+            f"**View link:** {row.view_link}"
+        )
+
+        mattermost.mm_upload(
+            mm_client,
+            mm_channel,
+            message,
+            image=io.BytesIO(image_buffer.getvalue()),
+            img_name=filename,
+        )
 
     ## Persist the newly processed pairs for the next run
     if not volc_features.empty:
@@ -152,6 +185,5 @@ if __name__ == "__main__":
             "processed_at": datetime.now(timezone.utc),
         })
 
-        pandas.concat([processed_df, new_rows], ignore_index=True)
+        processed_df = pandas.concat([processed_df, new_rows], ignore_index=True)
         _save_processed_pairs(processed_df)
-
