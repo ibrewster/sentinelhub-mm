@@ -140,8 +140,9 @@ if __name__ == "__main__":
     volc_features = volc_features.sort_values(["color_rank", "region", "pos"], kind="stable")
     volc_features = volc_features.reset_index(drop=True)
 
+    # TODO: Create an image for each scene using the functions in graphics.py, and hold them in memory for the mattermost post.
+    # Thought: do we need to loop through the volc_features DataFrame, and create and post the image one at a time, or can we create all the images first and then post them all at once?  I think the latter is better, but it may require more memory.  We'll see how many scenes we get back from the search.
     ## TODO: Make a mattermost post with the results, including volcano name, sensor, acquisition time, cloud cover, coverage percentage, and view link.
-    ## TODO: Implement the mattermost post functionality here.
 
     ## Persist the newly processed pairs for the next run
     if not volc_features.empty:

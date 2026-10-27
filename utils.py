@@ -1,6 +1,7 @@
 import sys
 
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlencode
 
 import numpy
@@ -9,27 +10,29 @@ import pandas
 import requests
 import shapely
 
-import config
 import constants
 
-def build_bbox(lat: np.ndarray, lon: np.ndarray, size_km: float = 10.0) -> np.ndarray:
+
+class BBoxEdges(NamedTuple):
+    """Bounding-box edges in degrees. Floats for scalar input, arrays otherwise."""
+    west: float | np.ndarray
+    south: float | np.ndarray
+    east: float | np.ndarray
+    north: float | np.ndarray
+
+KM_PER_DEG_LAT = 111.32
+
+def bbox_edges(lat, lon, size_km: float = 10.0) -> BBoxEdges:
     """
-    Build an approximately `size_km` x `size_km` bounding box centred on
-    (lat, lon). The box is `size_km` across in both dimensions, i.e. it extends
-    half of `size_km` in each direction from the centre.
+    Compute the edges of an approximately `size_km` x `size_km` box centred on
+    (lat, lon), using a local equirectangular approximation: 1° latitude is
+    ~111.32 km everywhere, while 1° longitude shrinks by cos(latitude).
 
-    Uses a local equirectangular approximation, which is accurate for small
-    boxes (a few km) at any latitude, including the high latitudes of the
-    Aleutians. Longitude degrees are scaled by cos(latitude).
-
-    Args:
-        lat: Latitude(s) as a scalar float or numpy array.
-        lon: Longitude(s) as a scalar float or numpy array.
-        size_km: Size of the bounding box in kilometers (default 10.0).
-
-    Returns:
-        A numpy array of shapely box geometries.
+    Accepts scalars or numpy arrays (broadcast together). Returns floats if
+    both inputs are scalar, arrays otherwise. The box extends size_km / 2 in
+    each direction from the centre; latitudes are clamped to [-90, 90].
     """
+    scalar_input = np.isscalar(lat) and np.isscalar(lon)
     lat = np.asarray(lat, dtype=np.float64)
     lon = np.asarray(lon, dtype=np.float64)
 
@@ -39,19 +42,24 @@ def build_bbox(lat: np.ndarray, lon: np.ndarray, size_km: float = 10.0) -> np.nd
         raise ValueError(f"longitude out of range: {lon}")
 
     half = size_km / 2.0
-    # 1 degree of latitude ~= 111.32 km everywhere.
-    dlat = half / 111.32
-    # 1 degree of longitude shrinks toward the poles.
+    dlat = half / KM_PER_DEG_LAT
     cos_lat = np.cos(np.radians(lat))
-    # Guard against division by ~0 at the poles.
-    dlon = np.where(cos_lat > 1e-6, half / (111.32 * cos_lat), 180.0)
+    dlon = np.where(cos_lat > 1e-6, half / (KM_PER_DEG_LAT * cos_lat), 180.0)
 
-    west = lon - dlon
-    east = lon + dlon
-    south = np.maximum(lat - dlat, -90.0)
-    north = np.minimum(lat + dlat, 90.0)
+    edges = (
+        lon - dlon,
+        np.maximum(lat - dlat, -90.0),
+        lon + dlon,
+        np.minimum(lat + dlat, 90.0),
+    )
+    if scalar_input:
+        edges = tuple(float(e) for e in edges)
+    return BBoxEdges(*edges)
 
-    return shapely.box(west, south, east, north)
+
+def build_bbox(lat, lon, size_km: float = 10.0) -> np.ndarray:
+    """Numpy array of shapely boxes centred on (lat, lon). See `bbox_edges`."""
+    return shapely.box(*bbox_edges(lat, lon, size_km))
 
 _NAME_SUFFIXES = (" seamount", " volcano", " islands", " island")
 
