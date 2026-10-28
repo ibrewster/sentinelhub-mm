@@ -70,8 +70,8 @@ if __name__ == "__main__":
     ## Format the times as ISO 8601 strings for the STAC API query.
     start_iso = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"start_time: {start_time.isoformat()}")
-    print(f"end_time: {end_time.isoformat()}")
+    logging.info(f"start_time: {start_time.isoformat()}")
+    logging.info(f"end_time: {end_time.isoformat()}")
 
     ## Load the volcano targets and their bounding boxes for the search.
     targets = utils.load_targets()
@@ -102,6 +102,10 @@ if __name__ == "__main__":
     ## Authenticate with SentinelHub and perform the search.
     session = sentinelhub.auth()
     features = sentinelhub.search_sentinelhub(session, payload)
+
+    if features.empty:
+        logging.warning("No features found.")
+        exit()
 
     ## Associate each scene with its volcano(s).
     targets=targets.reset_index(drop=True)
@@ -136,6 +140,10 @@ if __name__ == "__main__":
         dropped = before_count - len(volc_features)
         if dropped > 0:
             print(f"Dropped {dropped} already-processed (volcano, key) pairs.")
+
+    if volc_features.empty:
+        logging.info("No new (volcano, key) pairs to process after filtering.")
+        exit()
 
     # IDEA: if we want coverage calculation, we need to union the 'scene_geo'
     # geometries across (volcano, key) pairs before dropping duplicates,
