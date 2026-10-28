@@ -51,6 +51,17 @@ def _save_processed_pairs(df: pandas.DataFrame) -> None:
     df.to_pickle(config.PROCESSED_PAIRS_FILE)
 
 
+def _save_successful_pairs(processed_df: pandas.DataFrame, pairs) -> None:
+    """Append successfully posted (volcano, key) pairs to the processed file."""
+    if not pairs:
+        return
+
+    new_rows = pandas.DataFrame(pairs, columns=["volcano", "key"])
+    new_rows["processed_at"] = datetime.now(timezone.utc)
+    processed_df = pandas.concat([processed_df, new_rows], ignore_index=True)
+    _save_processed_pairs(processed_df)
+
+
 if __name__ == "__main__":
     ## Determine the time range for the search: from MAX_TIMESPAN hours ago to now.
     end_time = datetime.now(timezone.utc)
@@ -169,54 +180,50 @@ if __name__ == "__main__":
 
     ## Render each scene sequentially and post it to Mattermost immediately.
     mm_client, mm_channel = mattermost.connect()
-    for row in volc_features.itertuples(index=False):
-        image = graphics.render_scene_image(
-            session=session,
-            target=row.volcano,
-            lat=row.latitude,
-            lon=row.longitude,
-            sensor=row.sensor,
-            acquired=row.acquired,
-            nighttime=row.nighttime,
-        )
-        image_buffer = io.BytesIO()
-        image.save(image_buffer, format="PNG")
-
-        filename = (
-            f"{row.volcano}_{row.sensor}_{row.acquired}.png"
-        )
-        imagery_note = ""
-        if row.nighttime:
-            imagery_note = (
-                "**Imagery:** Thermal infrared (Landsat Band 10)\n"
-                if row.sensor == "Landsat 8-9 L1"
-                else "**Imagery:** Nighttime; no thermal bands available\n"
+    successful_pairs = []
+    try:
+        for row in volc_features.itertuples(index=False):
+            image = graphics.render_scene_image(
+                session=session,
+                target=row.volcano,
+                lat=row.latitude,
+                lon=row.longitude,
+                sensor=row.sensor,
+                acquired=row.acquired,
+                nighttime=row.nighttime,
             )
-        message = (
-            f"### {row.volcano} ({row.color})\n"
-            f"**Sensor:** {row.sensor}\n"
-            f"**Acquired:** {row.acquired} UTC\n"
-            f"{imagery_note}"
-   #         f"**Cloud cover:** {row.cloud:.1f}%\n"
-   #         f"**Coverage:** {row.coverage * 100:.1f}%\n"
-            f"**View link:** {row.view_link}"
-        )
+            image_buffer = io.BytesIO()
+            image.save(image_buffer, format="PNG")
 
-        mattermost.mm_upload(
-            mm_client,
-            mm_channel,
-            message,
-            image=io.BytesIO(image_buffer.getvalue()),
-            img_name=filename,
-        )
+            filename = (
+                f"{row.volcano}_{row.sensor}_{row.acquired}.png"
+            )
+            imagery_note = ""
+            if row.nighttime:
+                imagery_note = (
+                    "**Imagery:** Thermal infrared (Landsat Band 10)\n"
+                    if row.sensor == "Landsat 8-9 L1"
+                    else "**Imagery:** Nighttime; no thermal bands available\n"
+                )
+            message = (
+                f"### {row.volcano} ({row.color})\n"
+                f"**Sensor:** {row.sensor}\n"
+                f"**Acquired:** {row.acquired} UTC\n"
+                f"{imagery_note}"
+       #         f"**Cloud cover:** {row.cloud:.1f}%\n"
+       #         f"**Coverage:** {row.coverage * 100:.1f}%\n"
+                f"**View link:** {row.view_link}"
+            )
 
-    ## Persist the newly processed pairs for the next run
-    if not volc_features.empty:
-        new_rows = pandas.DataFrame({
-            "volcano": volc_features["volcano"],
-            "key": volc_features["key"],
-            "processed_at": datetime.now(timezone.utc),
-        })
+            post_result = mattermost.mm_upload(
+                mm_client,
+                mm_channel,
+                message,
+                image=io.BytesIO(image_buffer.getvalue()),
+                img_name=filename,
+            )
+            if post_result is not None:
+                successful_pairs.append((row.volcano, row.key))
 
-        processed_df = pandas.concat([processed_df, new_rows], ignore_index=True)
-        _save_processed_pairs(processed_df)
+    finally:
+        _save_successful_pairs(processed_df, successful_pairs)
