@@ -1,5 +1,7 @@
 import sys
 
+import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlencode
@@ -21,6 +23,44 @@ class BBoxEdges(NamedTuple):
     north: float | np.ndarray
 
 KM_PER_DEG_LAT = 111.32
+
+
+def solar_elevation_degrees(acquired, lat, lon):
+    """Sun elevation (deg) for UTC timestamps at WGS84 lat/lon. Inputs broadcast."""
+    scalar_input = (
+        np.ndim(acquired) == 0 and np.ndim(lat) == 0 and np.ndim(lon) == 0
+    )
+    t = pandas.DatetimeIndex(pandas.to_datetime(np.atleast_1d(acquired), utc=True))
+    hours = (t.hour + t.minute / 60 + t.second / 3600 + t.microsecond / 3.6e9).to_numpy()
+    angle = 2 * np.pi / 365 * (t.dayofyear.to_numpy() - 1 + (hours - 12) / 24)
+
+    eqt = 229.18 * (
+        0.000075
+        + 0.001868 * np.cos(angle)
+        - 0.032077 * np.sin(angle)
+        - 0.014615 * np.cos(2 * angle)
+        - 0.040849 * np.sin(2 * angle)
+    )
+    decl = (
+        0.006918
+        - 0.399912 * np.cos(angle)
+        + 0.070257 * np.sin(angle)
+        - 0.006758 * np.cos(2 * angle)
+        + 0.000907 * np.sin(2 * angle)
+        - 0.002697 * np.cos(3 * angle)
+        + 0.00148 * np.sin(3 * angle)
+    )
+    solar_minutes = (hours * 60 + eqt + 4 * np.asarray(lon)) % 1440
+    hour_angle = np.radians(solar_minutes / 4 - 180)
+
+    lat_r = np.radians(lat)
+    sin_el = (
+        np.sin(lat_r) * np.sin(decl)
+        + np.cos(lat_r) * np.cos(decl) * np.cos(hour_angle)
+    )
+    elevation = np.degrees(np.arcsin(np.clip(sin_el, -1, 1)))
+    return elevation.item() if scalar_input else elevation
+
 
 def bbox_edges(lat, lon, size_km: float = 10.0) -> BBoxEdges:
     """

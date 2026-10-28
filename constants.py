@@ -16,7 +16,7 @@ TARGETS_CSV = 'SentinelHub_Monitor_Volcano_Locations.csv'
 # Run-time config
 ####################
 MAX_CLOUD_COVER = 80
-MAX_TIMESPAN = 24  # hours
+MAX_TIMESPAN = 48  # hours
 
 # How long to retain processed (volcano, key) pairs before they become eligible
 # for reprocessing again. Older entries are purged on each run.

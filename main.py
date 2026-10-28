@@ -74,12 +74,19 @@ if __name__ == "__main__":
         "datetime": f"{start_iso}/{end_iso}",
         "limit": 100,
     }
+    cloud_property = {"property": constants.CLOUD_COVER_FIELD}
+    cloud_filters = [
+        {"op": ">=", "args": [cloud_property, 0]},
+    ]
     if constants.MAX_CLOUD_COVER < 100:
-        payload["filter"] = {
-            "op": "<=",
-            "args": [{"property": constants.CLOUD_COVER_FIELD}, constants.MAX_CLOUD_COVER],
-        }
-        payload["filter-lang"] = "cql2-json"
+        cloud_filters.append(
+            {
+                "op": "<=",
+                "args": [cloud_property, constants.MAX_CLOUD_COVER],
+            }
+        )
+    payload["filter"] = {"op": "and", "args": cloud_filters}
+    payload["filter-lang"] = "cql2-json"
 
     ## Authenticate with SentinelHub and perform the search.
     session = sentinelhub.auth()
@@ -97,6 +104,12 @@ if __name__ == "__main__":
         .drop(columns=["feature_idx", "target_idx"])
     )
 
+    # Unknown cloud cover (commonly reported as -1) must not be treated as
+    # clearer than valid scenes when choosing one acquisition per volcano.
+    volc_features = volc_features[
+        volc_features["cloud"].between(0, constants.MAX_CLOUD_COVER)
+    ]
+
     ## Drop any (volcano, key) pairs that have already been processed.
     processed_df = _load_processed_pairs()
     if not processed_df.empty:
@@ -113,6 +126,9 @@ if __name__ == "__main__":
         if dropped > 0:
             print(f"Dropped {dropped} already-processed (volcano, key) pairs.")
 
+    # IDEA: if we want coverage calculation, we need to union the 'scene_geo'
+    # geometries across (volcano, key) pairs before dropping duplicates,
+    # otherwise we will only have the coverage of the least-cloudy scene for each volcano.
     ## Sort by cloud cover and drop any (volcano, key) duplicates, keeping the least-cloudy scene for each volcano.
     volc_features = (
         volc_features.sort_values("cloud", kind="stable")
@@ -120,13 +136,15 @@ if __name__ == "__main__":
     )
 
     ## Calculate percentage overlap between the scene and the volcano bounding box
-    intersections = shapely.intersection(volc_features['scene_geo'], volc_features['bbox'])
-    volc_features['coverage'] = shapely.area(intersections) / shapely.area(volc_features['bbox'])
-
-    volc_features=volc_features.drop(columns=['scene_geo', 'bbox']) #Don't need these anymore.
+    ## NOTE: need to use unioned geometries for each (volcano, key) pair here (see IDEA above)
+    ## to get the total coverage
+    # intersections = shapely.intersection(volc_features['scene_geo'], volc_features['bbox'])
+    # volc_features['coverage'] = shapely.area(intersections) / shapely.area(volc_features['bbox'])
 
     ## Filter to only those with at least 50% overlap
     #volc_features = volc_features[volc_features['coverage'] >= 0.5]
+
+    volc_features=volc_features.drop(columns=['scene_geo', 'bbox']) #Don't need these anymore.
 
     ## Add view links for each scene to the Copernicus Browser for the appropriate sensor.
     volc_features['view_link'] = [
@@ -138,6 +156,12 @@ if __name__ == "__main__":
             volc_features['acquired'],
         )
     ]
+
+    volc_features['nighttime'] = (utils.solar_elevation_degrees(
+        volc_features['acquired'].to_numpy(),
+        volc_features['latitude'].to_numpy(),
+        volc_features['longitude'].to_numpy()
+    ) < 0)
 
     ## Sort by color severity, region, and longitude/latitude for display, and reset the index.
     volc_features = volc_features.sort_values(["color_rank", "region", "pos"], kind="stable")
@@ -153,6 +177,7 @@ if __name__ == "__main__":
             lon=row.longitude,
             sensor=row.sensor,
             acquired=row.acquired,
+            nighttime=row.nighttime,
         )
         image_buffer = io.BytesIO()
         image.save(image_buffer, format="PNG")
@@ -160,10 +185,18 @@ if __name__ == "__main__":
         filename = (
             f"{row.volcano}_{row.sensor}_{row.acquired}.png"
         )
+        imagery_note = ""
+        if row.nighttime:
+            imagery_note = (
+                "**Imagery:** Thermal infrared (Landsat Band 10)\n"
+                if row.sensor == "Landsat 8-9 L1"
+                else "**Imagery:** Nighttime; no thermal bands available\n"
+            )
         message = (
             f"### {row.volcano} ({row.color})\n"
             f"**Sensor:** {row.sensor}\n"
             f"**Acquired:** {row.acquired} UTC\n"
+            f"{imagery_note}"
    #         f"**Cloud cover:** {row.cloud:.1f}%\n"
    #         f"**Coverage:** {row.coverage * 100:.1f}%\n"
             f"**View link:** {row.view_link}"

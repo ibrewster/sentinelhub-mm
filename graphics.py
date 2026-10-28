@@ -4,13 +4,12 @@ graphics.py
 
 Render annotated preview images for matched volcano scenes using the Sentinel
 Hub Process API (CDSE). For each scene this fetches the exact 10x10 km bounding
-box as a highlight-optimized natural color PNG, then annotates it with:
+box as a highlight-optimized natural color PNG, or a thermal Band 10 rendering
+for nighttime Landsat acquisitions, then annotates it with:
 
   - a header: target name, sensor, and acquisition datetime
   - a scale bar (km)
   - latitude / longitude tick labels around the image
-
-Images are saved to a graphics/ subfolder as:  target_datetime_sensor.png
 
 This is the piece that genuinely needs the **Process API** (it renders pixels),
 as opposed to the Catalog API used for scene discovery.
@@ -29,7 +28,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib import patheffects as pe
 from matplotlib.ticker import FuncFormatter, MaxNLocator
-from PIL import Image
+from PIL import Image, ImageDraw
 from pycoast import ContourWriterAGG
 from pyresample.geometry import AreaDefinition
 
@@ -40,7 +39,7 @@ import config
 # Pixel size of the fetched imagery (square). 1000 px over 10 km = 10 m/px,
 # matching Sentinel-2's native resolution; Landsat (30 m) is upsampled.
 # Using a smaller image size (e.g. 512 px) reduces the download size.
-IMAGE_PX = 500
+IMAGE_PX = 512
 
 
 # -----------------------------------------------------------------------------
@@ -105,6 +104,34 @@ function evaluatePixel(s) {
 }
 """
 
+_LANDSAT_THERMAL_EVALSCRIPT = """//VERSION=3
+const thermalRamp = new ColorRampVisualizer([
+  [223, 0x003d99],
+  [253, 0x2e82ff],
+  [263, 0x80b3ff],
+  [272, 0xe0edff],
+  [273, 0xffffff],
+  [274, 0xfefce7],
+  [283, 0xfde191],
+  [293, 0xf69855],
+  [303, 0xec6927],
+  [323, 0xaa2d1d],
+  [363, 0x650401],
+  [373, 0x3d0200]
+]);
+
+function setup() {
+  return {
+    input: [{ bands: ["B10"] }],
+    output: { bands: 3 }
+  };
+}
+
+function evaluatePixel(sample) {
+  return thermalRamp.process(sample.B10);
+}
+"""
+
 EVALSCRIPTS = {
     "Sentinel-2 L1C": _S2_EVALSCRIPT,
     "Landsat 8-9 L1": _LANDSAT_EVALSCRIPT,
@@ -133,9 +160,17 @@ def safe_filename(target: str, acquired: str, sensor: str) -> str:
 # Process API fetch
 # -----------------------------------------------------------------------------
 def build_process_payload(
-    sensor: str, bbox: BBox, start_iso: str, end_iso: str, px: int = IMAGE_PX
+    sensor: str,
+    bbox: BBox,
+    start_iso: str,
+    end_iso: str,
+    px: int = IMAGE_PX,
+    thermal: bool = False,
 ) -> dict:
     """Build the Process API request body for a single scene's bbox and day."""
+    if thermal and sensor != "Landsat 8-9 L1":
+        raise ValueError("Thermal rendering is only supported for Landsat 8-9 L1")
+
     process_type = SENSORS[sensor]["process_type"]
     return {
         "input": {
@@ -157,12 +192,14 @@ def build_process_payload(
                 {"identifier": "default", "format": {"type": "image/png"}}
             ],
         },
-        "evalscript": EVALSCRIPTS[sensor],
+        "evalscript": (
+            _LANDSAT_THERMAL_EVALSCRIPT if thermal else EVALSCRIPTS[sensor]
+        ),
     }
 
 
 def fetch_scene_png(
-    session, sensor: str, bbox: BBox, acquired: str
+    session, sensor: str, bbox: BBox, acquired: str, thermal: bool = False
 ) -> bytes:
     """
     Fetch a single scene's imagery as PNG bytes via the Process API. The time
@@ -171,10 +208,29 @@ def fetch_scene_png(
     day = acquired[:10]
     start_iso = f"{day}T00:00:00Z"
     end_iso = f"{day}T23:59:59Z"
-    payload = build_process_payload(sensor, bbox, start_iso, end_iso)
+    payload = build_process_payload(
+        sensor, bbox, start_iso, end_iso, thermal=thermal
+    )
     resp = session.post(PROCESS_URL, json=payload)
     resp.raise_for_status()
     return resp.content
+
+
+def nighttime_placeholder_png() -> bytes:
+    """Create a local notice image for nighttime sensors without thermal bands."""
+    scene = Image.new("RGB", (IMAGE_PX, IMAGE_PX), (32, 35, 40))
+    draw = ImageDraw.Draw(scene)
+    draw.multiline_text(
+        (IMAGE_PX // 2, IMAGE_PX // 2),
+        "Nighttime acquisition\nNo thermal bands available",
+        anchor="mm",
+        align="center",
+        fill="white",
+        spacing=8,
+    )
+    buffer = io.BytesIO()
+    scene.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 # -----------------------------------------------------------------------------
@@ -264,13 +320,22 @@ def generate_scene_image(
     acquired: str,
     out_dir: str,
     bbox_km: float = 10.0,
+    *,
+    nighttime: bool,
 ) -> str:
     """
     Fetch, annotate, and save one scene image. Returns the saved file path.
     Raises on fetch/render errors (caller decides whether to continue).
     """
     img = render_scene_image(
-        session, target, lat, lon, sensor, acquired, bbox_km
+        session,
+        target,
+        lat,
+        lon,
+        sensor,
+        acquired,
+        bbox_km,
+        nighttime=nighttime,
     )
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, safe_filename(target, acquired, sensor))
@@ -286,8 +351,18 @@ def render_scene_image(
     sensor: str,
     acquired: str,
     bbox_km: float = 10.0,
+    *,
+    nighttime: bool,
 ):
     """Fetch and annotate one scene without writing it to disk."""
     bbox = BBox.centered(lat, lon, size_km=bbox_km)
-    png = fetch_scene_png(session, sensor, bbox, acquired)
-    return annotate_image(png, target, sensor, acquired, bbox, bbox_km)
+    thermal = sensor == "Landsat 8-9 L1" and nighttime
+
+    if sensor == "Sentinel-2 L1C" and nighttime:
+        png = nighttime_placeholder_png()
+        display_sensor = f"{sensor} (night; no thermal bands)"
+    else:
+        png = fetch_scene_png(session, sensor, bbox, acquired, thermal=thermal)
+        display_sensor = f"{sensor} (B10 TIR)" if thermal else sensor
+
+    return annotate_image(png, target, display_sensor, acquired, bbox, bbox_km)
