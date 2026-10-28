@@ -139,7 +139,7 @@ if __name__ == "__main__":
 
         dropped = before_count - len(volc_features)
         if dropped > 0:
-            print(f"Dropped {dropped} already-processed (volcano, key) pairs.")
+            logging.info(f"Dropped {dropped} already-processed (volcano, key) pairs.")
 
     if volc_features.empty:
         logging.info("No new (volcano, key) pairs to process after filtering.")
