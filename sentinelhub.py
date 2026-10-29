@@ -80,23 +80,13 @@ def auth(token_only: bool = False) -> dict | OAuth2Session:
 
 def acquisition_pass_key(sensor: str, scene_id: str, acquired: str) -> str:
     """
-    Return a key identifying the single acquisition pass a scene belongs to, so
-    that multiple tiles from the same overpass collapse to one result.
-
-    Prefers structure parsed from the scene id (Sentinel-2 datatake+orbit, or
-    Landsat path/row+date). Falls back to the acquisition datetime rounded to
-    the minute when the id format is unrecognized.
+        Return a key identifying the UTC date of the acquisition, aligning
+        with the 24-hour window used for thumbnail and link generation.
     """
-    safe_id = scene_id or ""
+    # Extract just the YYYY-MM-DD portion of the ISO8601 timestamp
+    date_str = (acquired or "")[:10]
 
-    if m := constants.S2_ID_RE.search(safe_id):
-        return f"S2:{m.group(1)}:R{m.group(2)}"
-
-    if m := constants.LANDSAT_ID_RE.match(safe_id):
-        return f"L:{m.group(1)}:{m.group(2)}"
-
-    # Fallback: round acquisition time to the minute (drop seconds/fraction).
-    return f"{sensor}:{(acquired or '')[:16]}"
+    return f"{sensor}:{date_str}"
 
 def features_to_frame(features: list[dict], sensor: str) -> pandas.DataFrame:
     """One row per STAC feature. Volcano association happens later."""
